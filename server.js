@@ -2,9 +2,6 @@
 console.log('ENV TEST:', process.env.DATABASE_URL ? 'DATABASE_URL IS SET' : 'DATABASE_URL IS NOT SET');
 console.log('PORT:', process.env.PORT);
 
-// Expert Climate Forecasting Platform - Backend API
-// Node.js + Fastify + PostgreSQL
-
 // server.js
 const fastify = require('fastify')({ logger: true });
 const bcrypt = require('bcrypt');
@@ -14,12 +11,6 @@ const { Pool } = require('pg');
 // Environment configuration
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const PORT = process.env.PORT || 3001;
-
-// ADD THIS BEFORE DATABASE CONNECTION:
-const fastifyLogger = require('fastify')({ logger: true });
-fastifyLogger.log.info('=== ENV CHECK ===');
-fastifyLogger.log.info('DATABASE_URL:', process.env.DATABASE_URL ? `SET (${process.env.DATABASE_URL.substring(0, 30)}...)` : 'NOT SET');
-fastifyLogger.log.info('=================');
 
 // Database connection
 const pool = new Pool({
@@ -107,89 +98,70 @@ fastify.post('/api/auth/register', async (request, reply) => {
 fastify.post('/api/auth/login', async (request, reply) => {
   const { email, password } = request.body;
   
-  console.log('Login attempt for:', email);
+  fastify.log.info({ email }, 'Login attempt');
 
   if (!email || !password) {
     return reply.code(400).send({ error: 'Email and password required' });
   }
 
   try {
-    console.log('Querying database for user...');
+    fastify.log.info('Querying database for user...');
     const result = await pool.query(
       'SELECT id, email, password_hash, full_name, organization, is_admin, is_approved FROM users WHERE email = $1',
       [email]
     );
 
-    console.log('Query result rows:', result.rows.length);
+    fastify.log.info({ rowCount: result.rows.length }, 'Query complete');
 
     if (result.rows.length === 0) {
-      console.log('User not found');
+      fastify.log.info('User not found');
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
 
     const user = result.rows[0];
-    console.log('User found:', user.email, 'Admin:', user.is_admin, 'Approved:', user.is_approved);
+    fastify.log.info({ email: user.email, isAdmin: user.is_admin, isApproved: user.is_approved }, 'User found');
 
     // Check if approved
     if (!user.is_approved && !user.is_admin) {
-      console.log('User not approved');
       return reply.code(403).send({ error: 'Account pending approval' });
     }
 
     // Verify password
-    console.log('Verifying password...');
+    fastify.log.info('Verifying password...');
     const validPassword = await bcrypt.compare(password, user.password_hash);
-    console.log('Password valid:', validPassword);
+    fastify.log.info({ valid: validPassword }, 'Password check complete');
     
     if (!validPassword) {
-      console.log('Invalid password');
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
 
-    console.log('Login successful, generating token...');
-    // Rest of your code...
-    
+    fastify.log.info('Login successful, generating token...');
+
+    // Update last login
+    await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
+
+    // Generate JWT
+    const token = fastify.jwt.sign({
+      userId: user.id,
+      email: user.email,
+      isAdmin: user.is_admin
+    });
+
+    reply.send({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        fullName: user.full_name,
+        organization: user.organization,
+        isAdmin: user.is_admin
+      }
+    });
   } catch (err) {
-    console.error('LOGIN ERROR:', err);
-    fastify.log.error(err);
+    fastify.log.error({ err }, 'LOGIN ERROR');
     reply.code(500).send({ error: 'Login failed' });
   }
 });
-
-fastify.log.info('Login successful, generating token...');
-
-try {
-  // Update last login
-  await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
-  fastify.log.info('Last login updated');
-
-  // Generate JWT
-  const token = fastify.jwt.sign({
-    userId: user.id,
-    email: user.email,
-    isAdmin: user.is_admin
-  });
-  fastify.log.info('Token generated successfully');
-
-  const response = {
-    token,
-    user: {
-      id: user.id,
-      email: user.email,
-      fullName: user.full_name,
-      organization: user.organization,
-      isAdmin: user.is_admin
-    }
-  };
-  
-  fastify.log.info('Sending response...');
-  reply.send(response);
-  fastify.log.info('Response sent');
-  
-} catch (jwtError) {
-  fastify.log.error({ err: jwtError }, 'JWT/Response error');
-  reply.code(500).send({ error: 'Token generation failed' });
-}
 
 // Get current user
 fastify.get('/api/auth/me', {
