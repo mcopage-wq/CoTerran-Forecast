@@ -1,3 +1,7 @@
+// VERY FIRST LINE - before any requires
+console.log('ENV TEST:', process.env.DATABASE_URL ? 'DATABASE_URL IS SET' : 'DATABASE_URL IS NOT SET');
+console.log('PORT:', process.env.PORT);
+
 // Expert Climate Forecasting Platform - Backend API
 // Node.js + Fastify + PostgreSQL
 
@@ -11,18 +15,21 @@ const { Pool } = require('pg');
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const PORT = process.env.PORT || 3001;
 
+// ADD THIS BEFORE DATABASE CONNECTION:
+const fastifyLogger = require('fastify')({ logger: true });
+fastifyLogger.log.info('=== ENV CHECK ===');
+fastifyLogger.log.info('DATABASE_URL:', process.env.DATABASE_URL ? `SET (${process.env.DATABASE_URL.substring(0, 30)}...)` : 'NOT SET');
+fastifyLogger.log.info('=================');
+
 // Database connection
 const pool = new Pool({
-  host: process.env.DB_HOST || 'localhost',
-  port: process.env.DB_PORT || 5432,
-  database: process.env.DB_NAME || 'climate_forecast',
-  user: process.env.DB_USER || 'postgres',
-  password: process.env.DB_PASSWORD || 'postgres',
+  connectionString: process.env.DATABASE_URL,
+  ssl: { rejectUnauthorized: false }
 });
 
 // Plugins
 fastify.register(require('@fastify/cors'), {
-  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
+  origin: process.env.FRONTEND_URL || 'https://coterran-forecast-frontend-production.up.railway.app',
   credentials: true
 });
 
@@ -99,55 +106,51 @@ fastify.post('/api/auth/register', async (request, reply) => {
 // Login
 fastify.post('/api/auth/login', async (request, reply) => {
   const { email, password } = request.body;
+  
+  console.log('Login attempt for:', email);
 
   if (!email || !password) {
     return reply.code(400).send({ error: 'Email and password required' });
   }
 
   try {
+    console.log('Querying database for user...');
     const result = await pool.query(
       'SELECT id, email, password_hash, full_name, organization, is_admin, is_approved FROM users WHERE email = $1',
       [email]
     );
 
+    console.log('Query result rows:', result.rows.length);
+
     if (result.rows.length === 0) {
+      console.log('User not found');
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
 
     const user = result.rows[0];
+    console.log('User found:', user.email, 'Admin:', user.is_admin, 'Approved:', user.is_approved);
 
     // Check if approved
     if (!user.is_approved && !user.is_admin) {
+      console.log('User not approved');
       return reply.code(403).send({ error: 'Account pending approval' });
     }
 
     // Verify password
+    console.log('Verifying password...');
     const validPassword = await bcrypt.compare(password, user.password_hash);
+    console.log('Password valid:', validPassword);
+    
     if (!validPassword) {
+      console.log('Invalid password');
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
 
-    // Update last login
-    await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
-
-    // Generate JWT
-    const token = fastify.jwt.sign({
-      userId: user.id,
-      email: user.email,
-      isAdmin: user.is_admin
-    });
-
-    reply.send({
-      token,
-      user: {
-        id: user.id,
-        email: user.email,
-        fullName: user.full_name,
-        organization: user.organization,
-        isAdmin: user.is_admin
-      }
-    });
+    console.log('Login successful, generating token...');
+    // Rest of your code...
+    
   } catch (err) {
+    console.error('LOGIN ERROR:', err);
     fastify.log.error(err);
     reply.code(500).send({ error: 'Login failed' });
   }
