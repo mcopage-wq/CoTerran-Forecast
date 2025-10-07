@@ -1,7 +1,3 @@
-// VERY FIRST LINE - before any requires
-console.log('ENV TEST:', process.env.DATABASE_URL ? 'DATABASE_URL IS SET' : 'DATABASE_URL IS NOT SET');
-console.log('PORT:', process.env.PORT);
-
 // server.js
 const fastify = require('fastify')({ logger: true });
 const bcrypt = require('bcrypt');
