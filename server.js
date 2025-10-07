@@ -7,6 +7,7 @@ const { Pool } = require('pg');
 // Environment configuration
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key-change-in-production';
 const PORT = process.env.PORT || 3001;
+const ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'admin@coterran.co';
 
 // Database connection
 const pool = new Pool({
@@ -45,6 +46,14 @@ fastify.decorate('requireAdmin', async (request, reply) => {
   }
 });
 
+// Helper function to get display name
+function getDisplayName(user) {
+  if (user.use_anonymous) {
+    return user.display_name || `Expert ${user.id.substring(0, 8)}`;
+  }
+  return user.full_name;
+}
+
 // ============================================
 // AUTH ROUTES
 // ============================================
@@ -53,8 +62,7 @@ fastify.decorate('requireAdmin', async (request, reply) => {
 fastify.post('/api/auth/register', async (request, reply) => {
   const { email, password, fullName, organization, expertiseArea, bio } = request.body;
 
-  // Validation
-  if (!email || !password || !fullName) {
+  if (!email || !password || !fullName || !organization) {
     return reply.code(400).send({ error: 'Missing required fields' });
   }
 
@@ -63,21 +71,18 @@ fastify.post('/api/auth/register', async (request, reply) => {
   }
 
   try {
-    // Check if user exists
     const existing = await pool.query('SELECT id FROM users WHERE email = $1', [email]);
     if (existing.rows.length > 0) {
       return reply.code(400).send({ error: 'Email already registered' });
     }
 
-    // Hash password
     const passwordHash = await bcrypt.hash(password, 10);
 
-    // Create user (requires approval)
     const result = await pool.query(
       `INSERT INTO users (email, password_hash, full_name, organization, expertise_area, bio, is_approved)
        VALUES ($1, $2, $3, $4, $5, $6, false)
        RETURNING id, email, full_name, organization, expertise_area, is_approved`,
-      [email, passwordHash, fullName, organization, expertiseArea, bio]
+      [email, passwordHash, fullName, organization, expertiseArea || null, bio || null]
     );
 
     reply.send({
@@ -100,7 +105,9 @@ fastify.post('/api/auth/login', async (request, reply) => {
 
   try {
     const result = await pool.query(
-      'SELECT id, email, password_hash, full_name, organization, is_admin, is_approved FROM users WHERE email = $1',
+      `SELECT id, email, password_hash, full_name, organization, is_admin, is_approved, 
+              use_anonymous, display_name 
+       FROM users WHERE email = $1`,
       [email]
     );
 
@@ -132,9 +139,11 @@ fastify.post('/api/auth/login', async (request, reply) => {
       user: {
         id: user.id,
         email: user.email,
-        full_name: user.full_name,        // ✅ snake_case
+        full_name: user.full_name,
         organization: user.organization,
-        is_admin: user.is_admin          // ✅ snake_case
+        is_admin: user.is_admin,
+        use_anonymous: user.use_anonymous || false,
+        display_name: user.display_name
       }
     });
   } catch (err) {
@@ -150,7 +159,8 @@ fastify.get('/api/auth/me', {
   try {
     const result = await pool.query(
       `SELECT id, email, full_name, organization, expertise_area, bio, 
-              is_admin, total_predictions, accuracy_score, rank, created_at
+              is_admin, use_anonymous, display_name, total_predictions, 
+              accuracy_score, rank, created_at
        FROM users WHERE id = $1`,
       [request.user.userId]
     );
@@ -166,6 +176,120 @@ fastify.get('/api/auth/me', {
   }
 });
 
+// Password reset request
+fastify.post('/api/auth/reset-password-request', async (request, reply) => {
+  const { email } = request.body;
+
+  if (!email) {
+    return reply.code(400).send({ error: 'Email required' });
+  }
+
+  try {
+    const result = await pool.query('SELECT id, full_name FROM users WHERE email = $1', [email]);
+    
+    if (result.rows.length === 0) {
+      // Don't reveal if email exists
+      return reply.send({ message: 'If the email exists, a reset link has been sent' });
+    }
+
+    // Generate reset token (expires in 1 hour)
+    const resetToken = fastify.jwt.sign(
+      { userId: result.rows[0].id, type: 'password-reset' },
+      { expiresIn: '1h' }
+    );
+
+    // In production, send email here
+    // For now, log it (in production, use a proper email service)
+    fastify.log.info(`Password reset token for ${email}: ${resetToken}`);
+    fastify.log.info(`Reset link: ${process.env.FRONTEND_URL}/reset-password?token=${resetToken}`);
+
+    // TODO: Send email with reset link
+    // await sendEmail(email, 'Password Reset', `Reset link: ${resetLink}`);
+
+    reply.send({ 
+      message: 'If the email exists, a reset link has been sent',
+      // Remove this in production - only for testing
+      _dev_token: process.env.NODE_ENV === 'development' ? resetToken : undefined
+    });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to process request' });
+  }
+});
+
+// ============================================
+// USER PROFILE ROUTES
+// ============================================
+
+// Update profile
+fastify.put('/api/users/profile', {
+  onRequest: [fastify.authenticate]
+}, async (request, reply) => {
+  const { useAnonymous, displayName } = request.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE users 
+       SET use_anonymous = $1, display_name = $2, updated_at = NOW()
+       WHERE id = $3
+       RETURNING id, email, full_name, organization, is_admin, use_anonymous, display_name`,
+      [useAnonymous, displayName, request.user.userId]
+    );
+
+    if (result.rows.length === 0) {
+      return reply.code(404).send({ error: 'User not found' });
+    }
+
+    reply.send({ user: result.rows[0] });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to update profile' });
+  }
+});
+
+// Change password
+fastify.post('/api/users/change-password', {
+  onRequest: [fastify.authenticate]
+}, async (request, reply) => {
+  const { currentPassword, newPassword } = request.body;
+
+  if (!currentPassword || !newPassword) {
+    return reply.code(400).send({ error: 'Current and new password required' });
+  }
+
+  if (newPassword.length < 8) {
+    return reply.code(400).send({ error: 'Password must be at least 8 characters' });
+  }
+
+  try {
+    const result = await pool.query(
+      'SELECT password_hash FROM users WHERE id = $1',
+      [request.user.userId]
+    );
+
+    if (result.rows.length === 0) {
+      return reply.code(404).send({ error: 'User not found' });
+    }
+
+    const validPassword = await bcrypt.compare(currentPassword, result.rows[0].password_hash);
+    if (!validPassword) {
+      return reply.code(401).send({ error: 'Current password is incorrect' });
+    }
+
+    const newPasswordHash = await bcrypt.hash(newPassword, 10);
+
+    await pool.query(
+      'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+      [newPasswordHash, request.user.userId]
+    );
+
+    reply.send({ message: 'Password changed successfully' });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to change password' });
+  }
+});
+
 // ============================================
 // MARKET ROUTES
 // ============================================
@@ -177,13 +301,17 @@ fastify.get('/api/markets', async (request, reply) => {
   try {
     let query = `
       SELECT m.*, 
-             u.full_name as creator_name,
-             ma.median_prediction,
-             ma.mean_prediction,
-             ma.std_deviation
+             CASE 
+               WHEN u.use_anonymous THEN COALESCE(u.display_name, 'Expert ' || SUBSTRING(u.id::text, 1, 8))
+               ELSE u.full_name 
+             END as creator_name,
+             (SELECT COUNT(*) FROM predictions WHERE market_id = m.id) as prediction_count,
+             (SELECT COUNT(*) FROM comments WHERE market_id = m.id) as comment_count,
+             (SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY prediction) 
+              FROM predictions WHERE market_id = m.id) as median_prediction,
+             (SELECT AVG(prediction) FROM predictions WHERE market_id = m.id) as mean_prediction
       FROM markets m
       LEFT JOIN users u ON m.created_by = u.id
-      LEFT JOIN market_aggregates ma ON m.id = ma.market_id
       WHERE 1=1
     `;
     const params = [];
@@ -217,16 +345,18 @@ fastify.get('/api/markets/:id', async (request, reply) => {
   const { id } = request.params;
 
   try {
-    // Get market
     const marketResult = await pool.query(
       `SELECT m.*, 
-              u.full_name as creator_name,
-              ma.median_prediction,
-              ma.mean_prediction,
-              ma.std_deviation
+              CASE 
+                WHEN u.use_anonymous THEN COALESCE(u.display_name, 'Expert ' || SUBSTRING(u.id::text, 1, 8))
+                ELSE u.full_name 
+              END as creator_name,
+              (SELECT COUNT(*) FROM predictions WHERE market_id = m.id) as prediction_count,
+              (SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY prediction) 
+               FROM predictions WHERE market_id = m.id) as median_prediction,
+              (SELECT AVG(prediction) FROM predictions WHERE market_id = m.id) as mean_prediction
        FROM markets m
        LEFT JOIN users u ON m.created_by = u.id
-       LEFT JOIN market_aggregates ma ON m.id = ma.market_id
        WHERE m.id = $1`,
       [id]
     );
@@ -236,15 +366,16 @@ fastify.get('/api/markets/:id', async (request, reply) => {
     }
 
     const market = marketResult.rows[0];
-
-    // Get predictions (anonymized unless user is admin or it's their own)
     const userId = request.user?.userId;
+    const isAdmin = request.user?.isAdmin || false;
+
     const predictionsResult = await pool.query(
-      `SELECT p.id, p.prediction, p.confidence, p.reasoning, p.created_at,
+      `SELECT p.id, p.prediction, p.confidence, p.reasoning, p.created_at, p.updated_at,
               CASE 
-                WHEN p.user_id = $2 OR $3 = true OR p.is_public = true 
-                THEN u.full_name 
-                ELSE 'Anonymous' 
+                WHEN p.user_id = $2 THEN u.full_name
+                WHEN $3 = true THEN u.full_name
+                WHEN u.use_anonymous THEN COALESCE(u.display_name, 'Expert ' || SUBSTRING(u.id::text, 1, 8))
+                ELSE u.full_name
               END as predictor_name,
               CASE 
                 WHEN p.user_id = $2 THEN true 
@@ -254,7 +385,7 @@ fastify.get('/api/markets/:id', async (request, reply) => {
        LEFT JOIN users u ON p.user_id = u.id
        WHERE p.market_id = $1
        ORDER BY p.created_at DESC`,
-      [id, userId, request.user?.isAdmin || false]
+      [id, userId, isAdmin]
     );
 
     reply.send({
@@ -271,14 +402,7 @@ fastify.get('/api/markets/:id', async (request, reply) => {
 fastify.post('/api/markets', {
   onRequest: [fastify.requireAdmin]
 }, async (request, reply) => {
-  const {
-    question,
-    description,
-    category,
-    closeDate,
-    dataSource,
-    resolutionCriteria
-  } = request.body;
+  const { question, description, category, closeDate, dataSource, resolutionCriteria } = request.body;
 
   if (!question || !category || !closeDate || !resolutionCriteria) {
     return reply.code(400).send({ error: 'Missing required fields' });
@@ -287,13 +411,12 @@ fastify.post('/api/markets', {
   try {
     const result = await pool.query(
       `INSERT INTO markets 
-       (question, description, category, close_date, data_source, resolution_criteria, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       (question, description, category, close_date, data_source, resolution_criteria, created_by, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')
        RETURNING *`,
       [question, description, category, closeDate, dataSource, resolutionCriteria, request.user.userId]
     );
 
-    // Log audit
     await pool.query(
       `INSERT INTO audit_log (user_id, action, entity_type, entity_id, details)
        VALUES ($1, 'market_created', 'market', $2, $3)`,
@@ -304,6 +427,35 @@ fastify.post('/api/markets', {
   } catch (err) {
     fastify.log.error(err);
     reply.code(500).send({ error: 'Failed to create market' });
+  }
+});
+
+// Propose market (any authenticated user)
+fastify.post('/api/markets/propose', {
+  onRequest: [fastify.authenticate]
+}, async (request, reply) => {
+  const { question, description, category, closeDate, dataSource, resolutionCriteria } = request.body;
+
+  if (!question || !category || !closeDate || !resolutionCriteria || !dataSource) {
+    return reply.code(400).send({ error: 'Missing required fields' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO pending_markets 
+       (question, description, category, close_date, data_source, resolution_criteria, created_by, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
+       RETURNING *`,
+      [question, description, category, closeDate, dataSource, resolutionCriteria, request.user.userId]
+    );
+
+    reply.code(201).send({ 
+      message: 'Market proposal submitted for admin approval',
+      market: result.rows[0] 
+    });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to propose market' });
   }
 });
 
@@ -336,7 +488,26 @@ fastify.post('/api/markets/:id/resolve', {
       return reply.code(404).send({ error: 'Market not found' });
     }
 
-    // Audit log
+    // Calculate Brier scores for all predictions
+    await pool.query(`
+      UPDATE predictions 
+      SET brier_score = POWER((prediction / 100.0) - ($1 / 100.0), 2)
+      WHERE market_id = $2
+    `, [outcome, id]);
+
+    // Update user statistics
+    await pool.query(`
+      UPDATE users u
+      SET 
+        total_predictions = (SELECT COUNT(*) FROM predictions WHERE user_id = u.id),
+        accuracy_score = (
+          SELECT AVG(brier_score) 
+          FROM predictions 
+          WHERE user_id = u.id AND brier_score IS NOT NULL
+        )
+      WHERE id IN (SELECT DISTINCT user_id FROM predictions WHERE market_id = $1)
+    `, [id]);
+
     await pool.query(
       `INSERT INTO audit_log (user_id, action, entity_type, entity_id, details)
        VALUES ($1, 'market_resolved', 'market', $2, $3)`,
@@ -354,7 +525,7 @@ fastify.post('/api/markets/:id/resolve', {
 // PREDICTION ROUTES
 // ============================================
 
-// Submit or update prediction
+// Submit prediction
 fastify.post('/api/predictions', {
   onRequest: [fastify.authenticate]
 }, async (request, reply) => {
@@ -369,7 +540,6 @@ fastify.post('/api/predictions', {
   }
 
   try {
-    // Check market is open
     const marketCheck = await pool.query(
       'SELECT status, close_date FROM markets WHERE id = $1',
       [marketId]
@@ -387,34 +557,93 @@ fastify.post('/api/predictions', {
       return reply.code(400).send({ error: 'Market has closed' });
     }
 
-    // Insert or update prediction
+    // Check if prediction already exists
+    const existing = await pool.query(
+      'SELECT id FROM predictions WHERE market_id = $1 AND user_id = $2',
+      [marketId, request.user.userId]
+    );
+
+    if (existing.rows.length > 0) {
+      return reply.code(400).send({ error: 'You have already submitted a prediction for this market. Use the update endpoint to modify it.' });
+    }
+
     const result = await pool.query(
       `INSERT INTO predictions 
        (market_id, user_id, prediction, confidence, reasoning, is_public)
        VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (market_id, user_id) 
-       DO UPDATE SET 
-         prediction = $3,
-         confidence = $4,
-         reasoning = $5,
-         is_public = $6,
-         updated_at = NOW()
        RETURNING *`,
       [marketId, request.user.userId, prediction, confidence, reasoning, isPublic]
-    );
-
-    // Update market prediction count
-    await pool.query(
-      `UPDATE markets 
-       SET prediction_count = (SELECT COUNT(*) FROM predictions WHERE market_id = $1)
-       WHERE id = $1`,
-      [marketId]
     );
 
     reply.send({ prediction: result.rows[0] });
   } catch (err) {
     fastify.log.error(err);
     reply.code(500).send({ error: 'Failed to submit prediction' });
+  }
+});
+
+// Update prediction
+fastify.post('/api/predictions/update', {
+  onRequest: [fastify.authenticate]
+}, async (request, reply) => {
+  const { marketId, newPrediction, reasoning, sources } = request.body;
+
+  if (!marketId || newPrediction === undefined || !reasoning) {
+    return reply.code(400).send({ error: 'Market ID, new prediction, and reasoning required' });
+  }
+
+  if (newPrediction < 0 || newPrediction > 100) {
+    return reply.code(400).send({ error: 'Prediction must be between 0 and 100' });
+  }
+
+  try {
+    const marketCheck = await pool.query(
+      'SELECT status, close_date FROM markets WHERE id = $1',
+      [marketId]
+    );
+
+    if (marketCheck.rows.length === 0) {
+      return reply.code(404).send({ error: 'Market not found' });
+    }
+
+    if (marketCheck.rows[0].status !== 'open') {
+      return reply.code(400).send({ error: 'Market is not open' });
+    }
+
+    // Get current prediction
+    const currentPred = await pool.query(
+      'SELECT id, prediction FROM predictions WHERE market_id = $1 AND user_id = $2',
+      [marketId, request.user.userId]
+    );
+
+    if (currentPred.rows.length === 0) {
+      return reply.code(404).send({ error: 'No existing prediction found' });
+    }
+
+    const oldPrediction = currentPred.rows[0].prediction;
+    const predictionId = currentPred.rows[0].id;
+
+    // Record the update in history
+    await pool.query(
+      `INSERT INTO prediction_updates 
+       (prediction_id, old_prediction, new_prediction, reasoning, sources)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [predictionId, oldPrediction, newPrediction, reasoning, sources]
+    );
+
+    // Update the prediction
+    const result = await pool.query(
+      `UPDATE predictions 
+       SET prediction = $1, reasoning = $2, updated_at = NOW()
+       WHERE id = $3
+       RETURNING *`,
+      [newPrediction, reasoning, predictionId]
+    );
+
+    reply.send({ prediction: result.rows[0] });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to update prediction' });
   }
 });
 
@@ -440,26 +669,100 @@ fastify.get('/api/predictions/mine', {
 });
 
 // ============================================
+// COMMENT ROUTES
+// ============================================
+
+// Get comments for a market
+fastify.get('/api/markets/:id/comments', async (request, reply) => {
+  const { id } = request.params;
+
+  try {
+    const result = await pool.query(
+      `SELECT c.id, c.content, c.created_at, c.parent_id,
+              CASE 
+                WHEN u.use_anonymous THEN COALESCE(u.display_name, 'Expert ' || SUBSTRING(u.id::text, 1, 8))
+                ELSE u.full_name 
+              END as author_name,
+              u.id as user_id
+       FROM comments c
+       LEFT JOIN users u ON c.user_id = u.id
+       WHERE c.market_id = $1
+       ORDER BY c.created_at ASC`,
+      [id]
+    );
+
+    // Organize comments with replies
+    const comments = result.rows.filter(c => !c.parent_id);
+    const replies = result.rows.filter(c => c.parent_id);
+
+    comments.forEach(comment => {
+      comment.replies = replies.filter(r => r.parent_id === comment.id);
+    });
+
+    reply.send({ comments });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to fetch comments' });
+  }
+});
+
+// Post comment
+fastify.post('/api/markets/:id/comments', {
+  onRequest: [fastify.authenticate]
+}, async (request, reply) => {
+  const { id } = request.params;
+  const { content, parentId } = request.body;
+
+  if (!content || content.trim().length === 0) {
+    return reply.code(400).send({ error: 'Comment content required' });
+  }
+
+  try {
+    const result = await pool.query(
+      `INSERT INTO comments (market_id, user_id, content, parent_id)
+       VALUES ($1, $2, $3, $4)
+       RETURNING *`,
+      [id, request.user.userId, content.trim(), parentId || null]
+    );
+
+    reply.code(201).send({ comment: result.rows[0] });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to post comment' });
+  }
+});
+
+// ============================================
 // LEADERBOARD ROUTES
 // ============================================
 
 // Get leaderboard
 fastify.get('/api/leaderboard', async (request, reply) => {
-  const { limit = 50, period = 'all' } = request.query;
+  const { limit = 50 } = request.query;
 
   try {
     const result = await pool.query(
-      `SELECT 
-         u.id,
-         u.full_name,
-         u.organization,
-         u.expertise_area,
-         u.total_predictions,
-         u.accuracy_score,
-         ROW_NUMBER() OVER (ORDER BY u.accuracy_score DESC NULLS LAST) as rank
-       FROM users u
-       WHERE u.is_approved = true AND u.total_predictions > 0
-       ORDER BY u.accuracy_score DESC NULLS LAST
+      `WITH ranked_users AS (
+         SELECT 
+           u.id as user_id,
+           CASE 
+             WHEN u.use_anonymous THEN COALESCE(u.display_name, 'Expert ' || SUBSTRING(u.id::text, 1, 8))
+             ELSE u.full_name 
+           END as display_name,
+           COUNT(p.id) as total_predictions,
+           COUNT(CASE WHEN m.status = 'resolved' THEN 1 END) as resolved_predictions,
+           AVG(CASE WHEN p.brier_score IS NOT NULL THEN 1 - p.brier_score END) as average_accuracy,
+           AVG(p.brier_score) as brier_score,
+           ROW_NUMBER() OVER (ORDER BY AVG(p.brier_score) ASC NULLS LAST) as rank
+         FROM users u
+         LEFT JOIN predictions p ON u.id = p.user_id
+         LEFT JOIN markets m ON p.market_id = m.id
+         WHERE u.is_approved = true
+         GROUP BY u.id, u.use_anonymous, u.display_name, u.full_name
+         HAVING COUNT(p.id) > 0
+       )
+       SELECT * FROM ranked_users
+       ORDER BY rank
        LIMIT $1`,
       [limit]
     );
@@ -474,6 +777,25 @@ fastify.get('/api/leaderboard', async (request, reply) => {
 // ============================================
 // ADMIN ROUTES
 // ============================================
+
+// List pending users
+fastify.get('/api/admin/users/pending', {
+  onRequest: [fastify.requireAdmin]
+}, async (request, reply) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, email, full_name, organization, expertise_area, bio, created_at
+       FROM users
+       WHERE is_approved = false AND is_admin = false
+       ORDER BY created_at ASC`
+    );
+
+    reply.send({ users: result.rows });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to fetch pending users' });
+  }
+});
 
 // Approve user
 fastify.post('/api/admin/users/:id/approve', {
@@ -504,22 +826,108 @@ fastify.post('/api/admin/users/:id/approve', {
   }
 });
 
-// List pending users
-fastify.get('/api/admin/users/pending', {
+// List pending markets
+fastify.get('/api/admin/markets/pending', {
   onRequest: [fastify.requireAdmin]
 }, async (request, reply) => {
   try {
     const result = await pool.query(
-      `SELECT id, email, full_name, organization, expertise_area, bio, created_at
-       FROM users
-       WHERE is_approved = false AND is_admin = false
-       ORDER BY created_at ASC`
+      `SELECT pm.*, u.full_name as creator_name
+       FROM pending_markets pm
+       LEFT JOIN users u ON pm.created_by = u.id
+       WHERE pm.status = 'pending'
+       ORDER BY pm.created_at ASC`
     );
 
-    reply.send({ users: result.rows });
+    reply.send({ markets: result.rows });
   } catch (err) {
     fastify.log.error(err);
-    reply.code(500).send({ error: 'Failed to fetch pending users' });
+    reply.code(500).send({ error: 'Failed to fetch pending markets' });
+  }
+});
+
+// Approve market
+fastify.post('/api/admin/markets/:id/approve', {
+  onRequest: [fastify.requireAdmin]
+}, async (request, reply) => {
+  const { id } = request.params;
+  const updatedData = request.body || {};
+
+  try {
+    // Get pending market
+    const pendingResult = await pool.query(
+      'SELECT * FROM pending_markets WHERE id = $1',
+      [id]
+    );
+
+    if (pendingResult.rows.length === 0) {
+      return reply.code(404).send({ error: 'Pending market not found' });
+    }
+
+    const pending = pendingResult.rows[0];
+
+    // Create actual market with optional admin updates
+    const result = await pool.query(
+      `INSERT INTO markets 
+       (question, description, category, close_date, data_source, resolution_criteria, created_by, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'open')
+       RETURNING *`,
+      [
+        updatedData.question || pending.question,
+        updatedData.description || pending.description,
+        updatedData.category || pending.category,
+        updatedData.closeDate || pending.close_date,
+        updatedData.dataSource || pending.data_source,
+        updatedData.resolutionCriteria || pending.resolution_criteria,
+        pending.created_by
+      ]
+    );
+
+    // Mark as approved
+    await pool.query(
+      `UPDATE pending_markets SET status = 'approved' WHERE id = $1`,
+      [id]
+    );
+
+    await pool.query(
+      `INSERT INTO audit_log (user_id, action, entity_type, entity_id, details)
+       VALUES ($1, 'market_approved', 'market', $2, $3)`,
+      [request.user.userId, result.rows[0].id, JSON.stringify({ original_proposal: id })]
+    );
+
+    reply.send({ market: result.rows[0] });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to approve market' });
+  }
+});
+
+// Reject market
+fastify.post('/api/admin/markets/:id/reject', {
+  onRequest: [fastify.requireAdmin]
+}, async (request, reply) => {
+  const { id } = request.params;
+  const { reason } = request.body;
+
+  try {
+    const result = await pool.query(
+      `UPDATE pending_markets 
+       SET status = 'rejected', rejection_reason = $1
+       WHERE id = $2
+       RETURNING *`,
+      [reason, id]
+    );
+
+    if (result.rows.length === 0) {
+      return reply.code(404).send({ error: 'Pending market not found' });
+    }
+
+    // TODO: Send email notification to creator
+
+    reply.send({ message: 'Market proposal rejected', market: result.rows[0] });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to reject market' });
   }
 });
 
@@ -535,7 +943,13 @@ fastify.get('/api/admin/analytics', {
         (SELECT COUNT(*) FROM markets WHERE status = 'open') as open_markets,
         (SELECT COUNT(*) FROM markets WHERE status = 'resolved') as resolved_markets,
         (SELECT COUNT(*) FROM predictions) as total_predictions,
-        (SELECT AVG(prediction_count) FROM markets WHERE status = 'open') as avg_predictions_per_market
+        (SELECT COUNT(*) FROM pending_markets WHERE status = 'pending') as pending_markets,
+        (SELECT COUNT(*) FROM users WHERE is_approved = false) as pending_users,
+        (SELECT AVG(prediction_count) FROM (
+          SELECT COUNT(*) as prediction_count 
+          FROM predictions 
+          GROUP BY market_id
+        ) as counts) as avg_predictions_per_market
     `);
 
     reply.send({ analytics: stats.rows[0] });
@@ -561,5 +975,4 @@ const start = async () => {
 
 start();
 
-// Export for testing
 module.exports = fastify;
