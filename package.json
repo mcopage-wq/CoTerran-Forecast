@@ -1,0 +1,14 @@
+{
+     "name": "climate-forecast-api",
+     "version": "1.0.0",
+     "scripts": {
+       "start": "node server.js"
+     },
+     "dependencies": {
+       "fastify": "^4.24.3",
+       "@fastify/cors": "^8.4.1",
+       "@fastify/jwt": "^7.2.3",
+       "bcrypt": "^5.1.1",
+       "pg": "^8.11.3"
+     }
+   }
