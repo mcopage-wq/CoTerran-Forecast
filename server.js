@@ -54,6 +54,21 @@ function getDisplayName(user) {
   return user.full_name;
 }
 
+// Helper function to generate anonymous identifier
+function generateAnonymousId(userId) {
+  // Create a consistent but anonymous identifier based on user ID
+  const hash = require('crypto').createHash('sha256').update(userId).digest('hex');
+  return `Expert-${hash.substring(0, 8)}`;
+}
+
+// Update the getDisplayName function
+function getDisplayName(user) {
+  if (user.use_anonymous) {
+    return generateAnonymousId(user.id);
+  }
+  return user.display_name || user.full_name;
+}
+
 // ============================================
 // AUTH ROUTES
 // ============================================
