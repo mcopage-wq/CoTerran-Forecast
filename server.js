@@ -93,50 +93,34 @@ fastify.post('/api/auth/register', async (request, reply) => {
 // Login
 fastify.post('/api/auth/login', async (request, reply) => {
   const { email, password } = request.body;
-  
-  fastify.log.info({ email }, 'Login attempt');
 
   if (!email || !password) {
     return reply.code(400).send({ error: 'Email and password required' });
   }
 
   try {
-    fastify.log.info('Querying database for user...');
     const result = await pool.query(
       'SELECT id, email, password_hash, full_name, organization, is_admin, is_approved FROM users WHERE email = $1',
       [email]
     );
 
-    fastify.log.info({ rowCount: result.rows.length }, 'Query complete');
-
     if (result.rows.length === 0) {
-      fastify.log.info('User not found');
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
 
     const user = result.rows[0];
-    fastify.log.info({ email: user.email, isAdmin: user.is_admin, isApproved: user.is_approved }, 'User found');
 
-    // Check if approved
     if (!user.is_approved && !user.is_admin) {
       return reply.code(403).send({ error: 'Account pending approval' });
     }
 
-    // Verify password
-    fastify.log.info('Verifying password...');
     const validPassword = await bcrypt.compare(password, user.password_hash);
-    fastify.log.info({ valid: validPassword }, 'Password check complete');
-    
     if (!validPassword) {
       return reply.code(401).send({ error: 'Invalid credentials' });
     }
 
-    fastify.log.info('Login successful, generating token...');
-
-    // Update last login
     await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
 
-    // Generate JWT
     const token = fastify.jwt.sign({
       userId: user.id,
       email: user.email,
@@ -148,13 +132,13 @@ fastify.post('/api/auth/login', async (request, reply) => {
       user: {
         id: user.id,
         email: user.email,
-        fullName: user.full_name,
+        full_name: user.full_name,        // ✅ snake_case
         organization: user.organization,
-        isAdmin: user.is_admin
+        is_admin: user.is_admin          // ✅ snake_case
       }
     });
   } catch (err) {
-    fastify.log.error({ err }, 'LOGIN ERROR');
+    fastify.log.error(err);
     reply.code(500).send({ error: 'Login failed' });
   }
 });
