@@ -156,6 +156,41 @@ fastify.post('/api/auth/login', async (request, reply) => {
   }
 });
 
+fastify.log.info('Login successful, generating token...');
+
+try {
+  // Update last login
+  await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
+  fastify.log.info('Last login updated');
+
+  // Generate JWT
+  const token = fastify.jwt.sign({
+    userId: user.id,
+    email: user.email,
+    isAdmin: user.is_admin
+  });
+  fastify.log.info('Token generated successfully');
+
+  const response = {
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      fullName: user.full_name,
+      organization: user.organization,
+      isAdmin: user.is_admin
+    }
+  };
+  
+  fastify.log.info('Sending response...');
+  reply.send(response);
+  fastify.log.info('Response sent');
+  
+} catch (jwtError) {
+  fastify.log.error({ err: jwtError }, 'JWT/Response error');
+  reply.code(500).send({ error: 'Token generation failed' });
+}
+
 // Get current user
 fastify.get('/api/auth/me', {
   onRequest: [fastify.authenticate]
