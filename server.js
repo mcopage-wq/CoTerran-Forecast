@@ -537,7 +537,7 @@ fastify.post('/api/markets/:id/resolve', {
 });
 
 // ============================================
-// PREDICTION ROUTES
+// PREDICTION ROUTES (UPDATED WITH ODDS TRACKING)
 // ============================================
 
 // Submit prediction
@@ -554,35 +554,43 @@ fastify.post('/api/predictions', {
     return reply.code(400).send({ error: 'Prediction must be between 0 and 100' });
   }
 
+  const client = await pool.connect();
+
   try {
-    const marketCheck = await pool.query(
+    await client.query('BEGIN');
+
+    const marketCheck = await client.query(
       'SELECT status, close_date FROM markets WHERE id = $1',
       [marketId]
     );
 
     if (marketCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
       return reply.code(404).send({ error: 'Market not found' });
     }
 
     if (marketCheck.rows[0].status !== 'open') {
+      await client.query('ROLLBACK');
       return reply.code(400).send({ error: 'Market is not open' });
     }
 
     if (new Date(marketCheck.rows[0].close_date) < new Date()) {
+      await client.query('ROLLBACK');
       return reply.code(400).send({ error: 'Market has closed' });
     }
 
     // Check if prediction already exists
-    const existing = await pool.query(
+    const existing = await client.query(
       'SELECT id FROM predictions WHERE market_id = $1 AND user_id = $2',
       [marketId, request.user.userId]
     );
 
     if (existing.rows.length > 0) {
+      await client.query('ROLLBACK');
       return reply.code(400).send({ error: 'You have already submitted a prediction for this market. Use the update endpoint to modify it.' });
     }
 
-    const result = await pool.query(
+    const result = await client.query(
       `INSERT INTO predictions 
        (market_id, user_id, prediction, confidence, reasoning, is_public)
        VALUES ($1, $2, $3, $4, $5, $6)
@@ -590,10 +598,21 @@ fastify.post('/api/predictions', {
       [marketId, request.user.userId, prediction, confidence, reasoning, isPublic]
     );
 
+    // ✨ NEW: Record odds change for analytics
+    await client.query(
+      'SELECT record_odds_change($1, $2)',
+      [marketId, 'new_prediction']
+    );
+
+    await client.query('COMMIT');
+
     reply.send({ prediction: result.rows[0] });
   } catch (err) {
+    await client.query('ROLLBACK');
     fastify.log.error(err);
     reply.code(500).send({ error: 'Failed to submit prediction' });
+  } finally {
+    client.release();
   }
 });
 
@@ -611,27 +630,34 @@ fastify.post('/api/predictions/update', {
     return reply.code(400).send({ error: 'Prediction must be between 0 and 100' });
   }
 
+  const client = await pool.connect();
+
   try {
-    const marketCheck = await pool.query(
+    await client.query('BEGIN');
+
+    const marketCheck = await client.query(
       'SELECT status, close_date FROM markets WHERE id = $1',
       [marketId]
     );
 
     if (marketCheck.rows.length === 0) {
+      await client.query('ROLLBACK');
       return reply.code(404).send({ error: 'Market not found' });
     }
 
     if (marketCheck.rows[0].status !== 'open') {
+      await client.query('ROLLBACK');
       return reply.code(400).send({ error: 'Market is not open' });
     }
 
     // Get current prediction
-    const currentPred = await pool.query(
+    const currentPred = await client.query(
       'SELECT id, prediction FROM predictions WHERE market_id = $1 AND user_id = $2',
       [marketId, request.user.userId]
     );
 
     if (currentPred.rows.length === 0) {
+      await client.query('ROLLBACK');
       return reply.code(404).send({ error: 'No existing prediction found' });
     }
 
@@ -639,7 +665,7 @@ fastify.post('/api/predictions/update', {
     const predictionId = currentPred.rows[0].id;
 
     // Record the update in history
-    await pool.query(
+    await client.query(
       `INSERT INTO prediction_updates 
        (prediction_id, old_prediction, new_prediction, reasoning, sources)
        VALUES ($1, $2, $3, $4, $5)`,
@@ -647,7 +673,7 @@ fastify.post('/api/predictions/update', {
     );
 
     // Update the prediction
-    const result = await pool.query(
+    const result = await client.query(
       `UPDATE predictions 
        SET prediction = $1, reasoning = $2, updated_at = NOW()
        WHERE id = $3
@@ -655,10 +681,21 @@ fastify.post('/api/predictions/update', {
       [newPrediction, reasoning, predictionId]
     );
 
+    // ✨ NEW: Record odds change for analytics
+    await client.query(
+      'SELECT record_odds_change($1, $2)',
+      [marketId, 'updated_prediction']
+    );
+
+    await client.query('COMMIT');
+
     reply.send({ prediction: result.rows[0] });
   } catch (err) {
+    await client.query('ROLLBACK');
     fastify.log.error(err);
     reply.code(500).send({ error: 'Failed to update prediction' });
+  } finally {
+    client.release();
   }
 });
 
@@ -760,21 +797,30 @@ fastify.get('/api/leaderboard', async (request, reply) => {
       `WITH ranked_users AS (
          SELECT 
            u.id as user_id,
-           CASE 
-             WHEN u.use_anonymous THEN COALESCE(u.display_name, 'Expert ' || SUBSTRING(u.id::text, 1, 8))
-             ELSE u.full_name 
-           END as display_name,
-           COUNT(p.id) as total_predictions,
-           COUNT(CASE WHEN m.status = 'resolved' THEN 1 END) as resolved_predictions,
-           AVG(CASE WHEN p.brier_score IS NOT NULL THEN 1 - p.brier_score END) as average_accuracy,
-           AVG(p.brier_score) as brier_score,
-           ROW_NUMBER() OVER (ORDER BY AVG(p.brier_score) ASC NULLS LAST) as rank
+           u.full_name as display_name,
+           COUNT(p.id) FILTER (WHERE u.use_anonymous = false OR p.created_at < (
+             SELECT MIN(updated_at) FROM users WHERE id = u.id AND use_anonymous = true
+           )) as total_predictions,
+           COUNT(CASE WHEN m.status = 'resolved' AND (u.use_anonymous = false OR p.created_at < (
+             SELECT MIN(updated_at) FROM users WHERE id = u.id AND use_anonymous = true
+           )) THEN 1 END) as resolved_predictions,
+           AVG(CASE WHEN p.brier_score IS NOT NULL AND (u.use_anonymous = false OR p.created_at < (
+             SELECT MIN(updated_at) FROM users WHERE id = u.id AND use_anonymous = true
+           )) THEN 1 - p.brier_score END) as average_accuracy,
+           AVG(CASE WHEN u.use_anonymous = false OR p.created_at < (
+             SELECT MIN(updated_at) FROM users WHERE id = u.id AND use_anonymous = true
+           ) THEN p.brier_score END) as brier_score,
+           ROW_NUMBER() OVER (ORDER BY AVG(CASE WHEN u.use_anonymous = false OR p.created_at < (
+             SELECT MIN(updated_at) FROM users WHERE id = u.id AND use_anonymous = true
+           ) THEN p.brier_score END) ASC NULLS LAST) as rank
          FROM users u
          LEFT JOIN predictions p ON u.id = p.user_id
          LEFT JOIN markets m ON p.market_id = m.id
          WHERE u.is_approved = true
-         GROUP BY u.id, u.use_anonymous, u.display_name, u.full_name
-         HAVING COUNT(p.id) > 0
+         GROUP BY u.id, u.full_name
+         HAVING COUNT(CASE WHEN u.use_anonymous = false OR p.created_at < (
+           SELECT MIN(updated_at) FROM users WHERE id = u.id AND use_anonymous = true
+         ) THEN p.id END) > 0
        )
        SELECT * FROM ranked_users
        ORDER BY rank
@@ -971,6 +1017,351 @@ fastify.get('/api/admin/analytics', {
   } catch (err) {
     fastify.log.error(err);
     reply.code(500).send({ error: 'Failed to fetch analytics' });
+  }
+});
+
+// ============================================
+// ANALYTICS & ODDS ROUTES
+// Add these routes to your server.js file
+// Place them BEFORE the "START SERVER" section
+// ============================================
+
+// Get current odds for a market
+fastify.get('/api/markets/:id/odds', async (request, reply) => {
+  const { id } = request.params;
+
+  try {
+    const result = await pool.query(
+      `SELECT 
+        m.id,
+        m.question,
+        COUNT(p.id) as prediction_count,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.prediction) as median_prediction,
+        AVG(p.prediction) as mean_prediction,
+        STDDEV(p.prediction) as std_deviation,
+        -- Calculate current odds
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.prediction) as probability,
+        CASE 
+          WHEN PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.prediction) > 0 
+          THEN 100.0 / PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.prediction)
+          ELSE NULL 
+        END as decimal_odds,
+        -- Fractional odds (simplified)
+        CASE 
+          WHEN PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.prediction) > 0 
+          THEN ROUND(100 - PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.prediction))
+          ELSE NULL 
+        END as fractional_numerator,
+        CASE 
+          WHEN PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.prediction) > 0 
+          THEN ROUND(PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY p.prediction))
+          ELSE NULL 
+        END as fractional_denominator,
+        -- Confidence distribution
+        COUNT(*) FILTER (WHERE p.confidence = 'high') as high_confidence_count,
+        COUNT(*) FILTER (WHERE p.confidence = 'medium') as medium_confidence_count,
+        COUNT(*) FILTER (WHERE p.confidence = 'low') as low_confidence_count
+      FROM markets m
+      LEFT JOIN predictions p ON m.id = p.market_id
+      WHERE m.id = $1
+      GROUP BY m.id, m.question`,
+      [id]
+    );
+
+    if (result.rows.length === 0) {
+      return reply.code(404).send({ error: 'Market not found' });
+    }
+
+    const odds = result.rows[0];
+    
+    // Format the response
+    reply.send({
+      marketId: odds.id,
+      question: odds.question,
+      predictionCount: parseInt(odds.prediction_count, 10) || 0,
+      statistics: {
+        median: odds.median_prediction ? parseFloat(odds.median_prediction) : null,
+        mean: odds.mean_prediction ? parseFloat(odds.mean_prediction) : null,
+        stdDeviation: odds.std_deviation ? parseFloat(odds.std_deviation) : null
+      },
+      odds: {
+        probability: odds.probability ? parseFloat(odds.probability) : null,
+        decimal: odds.decimal_odds ? parseFloat(odds.decimal_odds) : null,
+        fractional: odds.fractional_numerator && odds.fractional_denominator 
+          ? `${odds.fractional_numerator}:${odds.fractional_denominator}`
+          : null,
+        impliedProbability: odds.probability ? parseFloat(odds.probability) : null
+      },
+      confidence: {
+        high: parseInt(odds.high_confidence_count, 10) || 0,
+        medium: parseInt(odds.medium_confidence_count, 10) || 0,
+        low: parseInt(odds.low_confidence_count, 10) || 0
+      }
+    });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to fetch odds' });
+  }
+});
+
+// Get analytics for a market with time period
+fastify.get('/api/markets/:id/analytics', async (request, reply) => {
+  const { id } = request.params;
+  const { period = 'daily', limit = 30 } = request.query;
+
+  try {
+    // Validate period
+    const validPeriods = ['daily', 'weekly', 'monthly', '3-monthly', 'annual'];
+    if (!validPeriods.includes(period)) {
+      return reply.code(400).send({ error: 'Invalid period' });
+    }
+
+    // Get snapshots for the period
+    let snapshotQuery;
+    let snapshotParams = [id];
+
+    if (period === 'daily') {
+      snapshotQuery = `
+        SELECT * FROM market_snapshots
+        WHERE market_id = $1 AND snapshot_type = 'daily'
+        ORDER BY snapshot_date DESC
+        LIMIT $2
+      `;
+      snapshotParams.push(limit);
+    } else if (period === 'weekly') {
+      snapshotQuery = `
+        SELECT * FROM market_snapshots
+        WHERE market_id = $1 AND snapshot_type = 'weekly'
+        ORDER BY snapshot_date DESC
+        LIMIT $2
+      `;
+      snapshotParams.push(limit);
+    } else if (period === 'monthly') {
+      snapshotQuery = `
+        SELECT * FROM market_snapshots
+        WHERE market_id = $1 AND snapshot_type = 'monthly'
+        ORDER BY snapshot_date DESC
+        LIMIT $2
+      `;
+      snapshotParams.push(limit);
+    } else if (period === '3-monthly') {
+      // Quarterly: January, April, July, October
+      snapshotQuery = `
+        SELECT * FROM market_snapshots
+        WHERE market_id = $1 
+          AND snapshot_type = 'monthly'
+          AND EXTRACT(MONTH FROM snapshot_date) IN (1, 4, 7, 10)
+        ORDER BY snapshot_date DESC
+        LIMIT $2
+      `;
+      snapshotParams.push(limit);
+    } else if (period === 'annual') {
+      // Annual: January snapshots only
+      snapshotQuery = `
+        SELECT * FROM market_snapshots
+        WHERE market_id = $1 
+          AND snapshot_type = 'monthly'
+          AND EXTRACT(MONTH FROM snapshot_date) = 1
+        ORDER BY snapshot_date DESC
+        LIMIT $2
+      `;
+      snapshotParams.push(limit);
+    }
+    
+    // Note: Monthly snapshots are preserved for future multi-year and decadal analysis
+    // Additional periods can be added by querying monthly snapshots with different filters:
+    // - 5-year: Monthly snapshots from last 60 months
+    // - Decadal: Annual snapshots (Jan only) from last 10+ years
+
+    const snapshots = await pool.query(snapshotQuery, snapshotParams);
+
+    // Get real-time odds history for more granular data
+    const oddsHistory = await pool.query(
+      `SELECT * FROM market_odds_history
+       WHERE market_id = $1
+       ORDER BY timestamp DESC
+       LIMIT 100`,
+      [id]
+    );
+
+    // Get market info
+    const marketInfo = await pool.query(
+      `SELECT question, category, status, created_at, close_date
+       FROM markets WHERE id = $1`,
+      [id]
+    );
+
+    if (marketInfo.rows.length === 0) {
+      return reply.code(404).send({ error: 'Market not found' });
+    }
+
+    reply.send({
+      market: marketInfo.rows[0],
+      period,
+      snapshots: snapshots.rows.map(s => ({
+        date: s.snapshot_date,
+        predictionCount: s.prediction_count,
+        median: parseFloat(s.median_prediction),
+        mean: parseFloat(s.mean_prediction),
+        stdDeviation: parseFloat(s.std_deviation),
+        odds: {
+          probability: parseFloat(s.probability),
+          decimal: parseFloat(s.decimal_odds),
+          fractional: s.fractional_odds_numerator && s.fractional_odds_denominator
+            ? `${s.fractional_odds_numerator}:${s.fractional_odds_denominator}`
+            : null
+        },
+        confidence: {
+          high: s.high_confidence_count,
+          medium: s.medium_confidence_count,
+          low: s.low_confidence_count
+        },
+        distribution: {
+          range_0_25: s.predictions_0_25,
+          range_25_50: s.predictions_25_50,
+          range_50_75: s.predictions_50_75,
+          range_75_100: s.predictions_75_100
+        }
+      })),
+      recentChanges: oddsHistory.rows.slice(0, 20).map(h => ({
+        timestamp: h.timestamp,
+        triggerType: h.trigger_type,
+        predictionCount: h.prediction_count,
+        probability: parseFloat(h.probability),
+        decimalOdds: parseFloat(h.decimal_odds),
+        change: parseFloat(h.probability_change)
+      }))
+    });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to fetch analytics' });
+  }
+});
+
+// Get odds history (real-time changes)
+fastify.get('/api/markets/:id/odds-history', async (request, reply) => {
+  const { id } = request.params;
+  const { limit = 100, hours = 24 } = request.query;
+
+  try {
+    const hoursInt = parseInt(hours, 10);
+    const limitInt = parseInt(limit, 10);
+    
+    const result = await pool.query(
+      `SELECT * FROM market_odds_history
+       WHERE market_id = $1
+         AND timestamp >= NOW() - INTERVAL '1 hour' * $2
+       ORDER BY timestamp DESC
+       LIMIT $3`,
+      [id, hoursInt, limitInt]
+    );
+
+    reply.send({
+      marketId: id,
+      timeRange: `${hours} hours`,
+      changes: result.rows.map(h => ({
+        timestamp: h.timestamp,
+        triggerType: h.trigger_type,
+        predictionCount: h.prediction_count,
+        probability: parseFloat(h.probability),
+        decimalOdds: parseFloat(h.decimal_odds),
+        previousProbability: h.previous_probability ? parseFloat(h.previous_probability) : null,
+        change: h.probability_change ? parseFloat(h.probability_change) : null
+      }))
+    });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to fetch odds history' });
+  }
+});
+
+// Get aggregated analytics for all markets
+fastify.get('/api/analytics/summary', async (request, reply) => {
+  try {
+    const result = await pool.query(`
+      WITH latest_snapshots AS (
+        SELECT DISTINCT ON (market_id)
+          market_id,
+          prediction_count,
+          probability,
+          decimal_odds,
+          snapshot_date
+        FROM market_snapshots
+        WHERE snapshot_type = 'daily'
+        ORDER BY market_id, snapshot_date DESC
+      )
+      SELECT
+        m.id,
+        m.question,
+        m.category,
+        m.status,
+        ls.prediction_count,
+        ls.probability,
+        ls.decimal_odds,
+        ls.snapshot_date as last_updated
+      FROM markets m
+      LEFT JOIN latest_snapshots ls ON m.id = ls.market_id
+      WHERE m.status = 'open'
+      ORDER BY ls.snapshot_date DESC NULLS LAST
+    `);
+
+    reply.send({
+      markets: result.rows.map(m => ({
+        id: m.id,
+        question: m.question,
+        category: m.category,
+        status: m.status,
+        predictionCount: m.prediction_count || 0,
+        currentOdds: {
+          probability: m.probability ? parseFloat(m.probability) : null,
+          decimal: m.decimal_odds ? parseFloat(m.decimal_odds) : null
+        },
+        lastUpdated: m.last_updated
+      }))
+    });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to fetch analytics summary' });
+  }
+});
+
+// Trigger snapshot creation (admin only - can be called manually or via cron)
+fastify.post('/api/admin/snapshots/create', {
+  onRequest: [fastify.requireAdmin]
+}, async (request, reply) => {
+  const { snapshotType = 'daily', marketId = null } = request.body;
+
+  try {
+    let markets;
+    
+    if (marketId) {
+      markets = await pool.query('SELECT id FROM markets WHERE id = $1', [marketId]);
+    } else {
+      markets = await pool.query('SELECT id FROM markets WHERE status = $1', ['open']);
+    }
+
+    let successCount = 0;
+    for (const market of markets.rows) {
+      try {
+        await pool.query(
+          'SELECT create_market_snapshot($1, $2)',
+          [market.id, snapshotType]
+        );
+        successCount++;
+      } catch (err) {
+        fastify.log.error(`Failed to create snapshot for market ${market.id}:`, err);
+      }
+    }
+
+    reply.send({
+      message: `Created ${successCount} snapshots`,
+      snapshotType,
+      marketsProcessed: markets.rows.length,
+      successCount
+    });
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500).send({ error: 'Failed to create snapshots' });
   }
 });
 
