@@ -2,7 +2,8 @@
      "name": "climate-forecast-api",
      "version": "1.0.0",
      "scripts": {
-          "start": "node server.js"
+          "start": "node server.js",
+          "cron": "node cron-snapshots.js"
      },
      "dependencies": {
           "@fastify/cors": "^8.4.1",
